@@ -18,7 +18,6 @@ class Vehicle:
         self.t_stay = 2 * (math.sqrt((r * r) - (e * e))) / self.speed
 
 
-
 v_min, v_max = mu - 3 * sigma, mu + 3 * sigma
 a, b = (v_min - mu) / sigma, (v_max - mu) / sigma
 dist = truncnorm(a, b, loc=mu, scale=sigma)
