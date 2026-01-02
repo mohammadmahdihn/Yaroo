@@ -34,6 +34,12 @@ def w_to_dbm(p_w):
 def db_to_linear(db: float) -> float:
     return 10.0 ** (db / 10.0)
 
+class Task:
+    def __init__(self):
+        self.h = 2
+        self.alpha_in = random.randint(4000, 20000)
+        self.C = self.h * self.alpha_in
+        self.t_max = random.randint(5, 10)
 
 class Vehicle:
     def __init__(self, speed_distribution):
@@ -42,6 +48,8 @@ class Vehicle:
         self.s = random.randint(1, max_position)  # s_i (current position)
         self.p_i = 1.3  # Transmission power of vehicle
         self.transmission_rate = self.calculate_transmission_rate()
+        self.task = Task()
+        self.t_ptd = min(self.task.t_max, self.t_stay)
 
     def calculate_transmission_rate(self):
         distance = r * math.ceil(self.s / r) - self.s
