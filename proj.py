@@ -4,8 +4,8 @@ from scipy.stats import truncnorm
 
 n = 10  # number of vehicles
 r = 200  # RSU communication range
-r_2 = 320  # Length of one RSU coverage segment
-e = 160  # vertical distance between the road and RSU
+e = 120  # vertical distance between the road and RSU
+r_2 = 2 * math.sqrt(r ** 2 - e ** 2)  # Length of one RSU coverage segment
 mu = 60  # average speed
 sigma = 10  # standard deviation of speed
 mm_wave_comm_range = 150
@@ -54,7 +54,7 @@ class Vehicle:
 
     def calculate_transmission_rate(self):
         distance_to_end_of_rsu_range = r_2 * math.ceil(self.s / r_2) - self.s
-        distance_to_rsu_center = math.sqrt((abs((r_2/2) - distance_to_end_of_rsu_range) ** 2) + (r ** 2 - (r_2/2) ** 2))
+        distance_to_rsu_center = math.sqrt((abs((r_2/2) - distance_to_end_of_rsu_range) ** 2) + (e ** 2))
         if distance_to_rsu_center <= mm_wave_comm_range:
             rate = self.calculate_cellular_transmission_rate(distance_to_end_of_rsu_range)
         elif distance_to_rsu_center <= cellular_link_comm_range:
