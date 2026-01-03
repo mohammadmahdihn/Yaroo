@@ -4,12 +4,13 @@ from scipy.stats import truncnorm
 
 n = 10  # number of vehicles
 r = 200  # RSU communication range
+r_2 = 320  # Length of one RSU coverage segment
 e = 160  # vertical distance between the road and RSU
 mu = 60  # average speed
 sigma = 10  # standard deviation of speed
 mm_wave_comm_range = 150
 cellular_link_comm_range = 200
-max_position = r * n
+max_position = r_2 * n
 rsu_max_data_rate = 1_000_000_000
 
 # cellular transmission rate variables
@@ -52,10 +53,15 @@ class Vehicle:
         self.t_ptd = min(self.task.t_max, self.t_stay)
 
     def calculate_transmission_rate(self):
-        distance = r * math.ceil(self.s / r) - self.s
-        cellular = self.calculate_cellular_transmission_rate(distance)
-        mmWave = self.calculate_mmWave_transmission_rate(distance)
-        return min(max(cellular, mmWave), rsu_max_data_rate)
+        distance_to_end_of_rsu_range = r_2 * math.ceil(self.s / r_2) - self.s
+        distance_to_rsu_center = math.sqrt((abs((r_2/2) - distance_to_end_of_rsu_range) ** 2) + (r ** 2 - (r_2/2) ** 2))
+        if distance_to_rsu_center <= mm_wave_comm_range:
+            rate = self.calculate_cellular_transmission_rate(distance_to_end_of_rsu_range)
+        elif distance_to_rsu_center <= cellular_link_comm_range:
+            rate = self.calculate_mmWave_transmission_rate(distance_to_end_of_rsu_range)
+        else:
+            raise Exception
+        return min(rate, rsu_max_data_rate)
 
     def calculate_cellular_transmission_rate(self, distance):
         d = max(distance, 1e-9)
@@ -84,4 +90,3 @@ a, b = (v_min - mu) / sigma, (v_max - mu) / sigma
 dist = truncnorm(a, b, loc=mu, scale=sigma)
 
 vehicles = [Vehicle(dist) for _ in range(n)]
-print(vehicles)
