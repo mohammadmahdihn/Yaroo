@@ -46,7 +46,7 @@ class Vehicle:
     def __init__(self, speed_distribution):
         self.speed = speed_distribution.rvs()
         self.t_stay = 2 * (math.sqrt((r * r) - (e * e))) / self.speed
-        self.s = random.randint(1, max_position)  # s_i (current position)
+        self.s = random.randint(1, round(max_position))  # s_i (current position)
         self.p_i = 1.3  # Transmission power of vehicle
         self.transmission_rate = self.calculate_transmission_rate()
         self.task = Task()
