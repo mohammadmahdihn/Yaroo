@@ -37,8 +37,8 @@ def db_to_linear(db: float) -> float:
 
 class Task:
     def __init__(self):
-        self.h = 2
-        self.alpha_in = random.randint(4000, 20000)
+        self.h = random.uniform(0.2, 0.4)
+        self.alpha_in = random.randint(20000, 60000)
         self.C = self.h * self.alpha_in
         self.t_max = random.randint(5, 10)
 
@@ -51,6 +51,10 @@ class Vehicle:
         self.transmission_rate = self.calculate_transmission_rate()
         self.task = Task()
         self.t_ptd = min(self.task.t_max, self.t_stay)
+        self.f_loc = random.uniform(10, 15)
+        self.t_loc = self.task.C / self.f_loc
+        self.zeta = random.uniform(1e-9, 3e-9)  # The consumption of energy per computing unit
+        self.e_loc = self.task.C * self.zeta
 
     def calculate_transmission_rate(self):
         distance_to_end_of_rsu_range = r_2 * math.ceil(self.s / r_2) - self.s
