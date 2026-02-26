@@ -37,7 +37,7 @@ from new_money import (
     utility_local, utility_vec,
     allocate_edge_cpu_bisection,
     distributed_macter,
-    make_vehicles, group_by_rsu,
+    make_vehicles, group_by_rsu, group_by_rsu_extended,
 )
 
 import matplotlib
@@ -213,6 +213,21 @@ TRIALS = 10  # Monte-Carlo trials per data point
 def _run_one_scenario(vehicles: List[Vehicle], params: SystemParams) -> dict:
     """Run all four algorithms on a pre-built vehicle list; return metric dict."""
     groups = group_by_rsu(vehicles, params.M)
+    vehicles_copy = copy.deepcopy(vehicles)
+    groups_ext = group_by_rsu_extended(vehicles_copy, params.M)
+
+    # ── MACTER-EXTENDED ────────────────────────────────────────────────────────────────
+    m_ex_eff, m_ex_util, m_ex_vratio, m_ex_delay = [], [], [], []
+    for vs in groups_ext.values():
+        if not vs:
+            continue
+        alloc, dec, eff = distributed_macter(
+            vs, params.F_vec_total_GHz, params.max_iter_algo2
+        )
+        m_ex_eff.append(eff)
+        m_ex_util.append(_avg_utility(vs, alloc, dec))
+        m_ex_vratio.append(_vec_ratio(dec))
+        m_ex_delay.append(_avg_delay(vs, alloc, dec))
 
     # ── MACTER ────────────────────────────────────────────────────────────────
     m_eff, m_util, m_vratio, m_delay = [], [], [], []
@@ -264,6 +279,9 @@ def _run_one_scenario(vehicles: List[Vehicle], params: SystemParams) -> dict:
         v_delay.append(_avg_delay(vs, alloc, dec))
 
     return dict(
+        macter_ex_eff=_mean(m_ex_eff),       macter_ex_util=_mean(m_ex_util),
+        macter_ex_vr=_mean(m_ex_vratio),     macter_ex_delay=_mean(m_ex_delay),  # Add extended MACTER
+
         macter_eff=_mean(m_eff),       macter_util=_mean(m_util),
         macter_vr=_mean(m_vratio),     macter_delay=_mean(m_delay),
 
@@ -292,9 +310,9 @@ def _std(lst):
 
 def sweep_num_vehicles(N_vals, params: SystemParams, outer_trials: int = 8):
     results = {k: [] for k in [
-        "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
-        "macter_util","rand_util","rand_util_std","local_util","allvec_util",
-        "macter_vr","rand_vr","macter_delay","rand_delay","local_delay","allvec_delay",
+        "macter_eff","macter_ex_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
+        "macter_util","macter_ex_util","rand_util","rand_util_std","local_util","allvec_util",
+        "macter_vr","macter_ex_vr","rand_vr","macter_delay","rand_delay","local_delay","allvec_delay",
     ]}
     for N in N_vals:
         print(f"  sweep_N: N={N}", flush=True)
@@ -320,7 +338,7 @@ def sweep_num_vehicles(N_vals, params: SystemParams, outer_trials: int = 8):
 
 def sweep_data_size(alpha_vals_kB, params: SystemParams, N: int = 20, outer_trials: int = 8):
     results = {k: [] for k in [
-        "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
+        "macter_ex_eff","macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
     ]}
     for a in alpha_vals_kB:
         print(f"  sweep_alpha: alpha={a}kB", flush=True)
@@ -347,7 +365,7 @@ def sweep_data_size(alpha_vals_kB, params: SystemParams, N: int = 20, outer_tria
 def sweep_f_total(f_vals_GHz, params: SystemParams, N: int = 30, outer_trials: int = 8):
     """Sweep edge CPU budget — shows where the t_ptd feasibility check starts to bite."""
     results = {k: [] for k in [
-        "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
+        "macter_ex_eff","macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
         "macter_vr","rand_vr",
     ]}
     for f in f_vals_GHz:
@@ -369,8 +387,8 @@ def sweep_f_total(f_vals_GHz, params: SystemParams, N: int = 30, outer_trials: i
 
 def sweep_tmax(tmax_vals, params: SystemParams, N: int = 20, outer_trials: int = 8):
     results = {k: [] for k in [
-        "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
-        "macter_util","rand_util","rand_util_std","local_util","allvec_util",
+        "macter_ex_eff", "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
+        "macter_ex_util", "macter_util","rand_util","rand_util_std","local_util","allvec_util",
     ]}
     for tmax in tmax_vals:
         print(f"  sweep_tmax: tmax={tmax:.1f}s", flush=True)
@@ -442,12 +460,13 @@ def per_vehicle_snapshot(vehicles: List[Vehicle], params: SystemParams):
 
 COLORS = {
     "macter":  "#1a6faf",
+    "macter_ex":  "#049fa3",
     "random":  "#e05c2a",
     "local":   "#4caa4c",
     "allvec":  "#9b59b6",
 }
 
-MARKERS = {"macter": "o", "random": "s", "local": "^", "allvec": "D"}
+MARKERS = {"macter": "o", "random": "s", "local": "^", "allvec": "D", "macter_ex": "4"}
 LWIDTH  = 2.0
 MSIZE   = 7
 
@@ -494,18 +513,7 @@ def build_figure(out_path: str):
     snap_m = [macter_u[i] for i in vids]
     snap_r = [rand_u[i]   for i in vids]
 
-    # ── Experiment 5 (new): vary edge CPU budget F_total ────────────────────
-    f_vals = [50, 100, 200, 500, 1000, 2000, 4000, 8000]
-    print("Running sweep: edge CPU budget …")
-    res_F = sweep_f_total(f_vals, params, N=30, outer_trials=8)
-
-    # ── Experiment 6: convergence (utility vs iteration) ─────────────────────
-    print("Running convergence trace …")
-    conv_data = _convergence_trace(params, N=25, seed=7)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Layout: 5 rows × 2 cols
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Figure layout ────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(18, 25))
     fig.patch.set_facecolor("#f7f9fc")
 
@@ -519,11 +527,6 @@ def build_figure(out_path: str):
         fig.add_subplot(gs[0, 1]),   # 1 – avg utility vs N
         fig.add_subplot(gs[1, 0]),   # 2 – efficiency vs data size
         fig.add_subplot(gs[1, 1]),   # 3 – efficiency vs tmax
-        # fig.add_subplot(gs[2, 0]),   # 4 – avg utility vs tmax
-        # fig.add_subplot(gs[2, 1]),   # 5 – VEC offload ratio vs N
-        # fig.add_subplot(gs[3, 0]),   # 6 – efficiency vs F_total (NEW)
-        # fig.add_subplot(gs[3, 1]),   # 7 – convergence
-        # fig.add_subplot(gs[4, :]),   # 8 – per-vehicle utility bar (full width)
     ]
 
     for a in ax:
@@ -534,6 +537,8 @@ def build_figure(out_path: str):
     # ── Panel 0: Computation Efficiency vs N ─────────────────────────────────
     _plot_line(ax[0], N_vals, res_N["macter_eff"],  res_N["rand_eff_std"],
                "macter", "MACTER")
+    _plot_line(ax[0], N_vals, res_N["macter_ex_eff"], None,
+               "macter_ex", "MACTER + Extended", linestyle="-.")  # Add extended version
     _plot_line(ax[0], N_vals, res_N["rand_eff"],    res_N["rand_eff_std"],
                "random", "Random")
     _plot_line(ax[0], N_vals, res_N["local_eff"],   None,
@@ -549,6 +554,8 @@ def build_figure(out_path: str):
     # ── Panel 1: Avg Utility vs N ─────────────────────────────────────────────
     _plot_line(ax[1], N_vals, res_N["macter_util"], res_N["rand_util_std"],
                "macter", "MACTER")
+    _plot_line(ax[1], N_vals, res_N["macter_ex_util"], None,
+               "macter_ex", "MACTER + Extended", linestyle="-.")  # Add extended version
     _plot_line(ax[1], N_vals, res_N["rand_util"],   res_N["rand_util_std"],
                "random", "Random")
     _plot_line(ax[1], N_vals, res_N["local_util"],  None,
@@ -564,6 +571,8 @@ def build_figure(out_path: str):
     # ── Panel 2: Efficiency vs Data Size ─────────────────────────────────────
     _plot_line(ax[2], alpha_vals, res_alpha["macter_eff"], None,
                "macter", "MACTER")
+    _plot_line(ax[2], alpha_vals, res_alpha["macter_ex_eff"], None,
+               "macter_ex", "MACTER + Extended", linestyle="-.")  # Add extended version
     _plot_line(ax[2], alpha_vals, res_alpha["rand_eff"],   res_alpha["rand_eff_std"],
                "random", "Random")
     _plot_line(ax[2], alpha_vals, res_alpha["local_eff"],  None,
@@ -579,6 +588,8 @@ def build_figure(out_path: str):
     # ── Panel 3: Efficiency vs tmax ───────────────────────────────────────────
     _plot_line(ax[3], tmax_vals, res_tmax["macter_eff"], None,
                "macter", "MACTER")
+    _plot_line(ax[3], tmax_vals, res_tmax["macter_ex_eff"], None,
+               "macter_ex", "MACTER + Extended", linestyle="-.")  # Add extended version
     _plot_line(ax[3], tmax_vals, res_tmax["rand_eff"],   res_tmax["rand_eff_std"],
                "random", "Random")
     _plot_line(ax[3], tmax_vals, res_tmax["local_eff"],  None,

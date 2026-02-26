@@ -14,6 +14,8 @@ No SciPy required.
 """
 
 from __future__ import annotations
+
+import copy
 from dataclasses import dataclass, field
 import math
 import random
@@ -168,6 +170,7 @@ class Vehicle:
     # computed each snapshot
     rsu_id: int = field(init=False, default=0)
     dist_to_rsu_m: float = field(init=False, default=0.0)
+    rsu_coverage_time: float = field(init=False, default=0.0)
     link_type: str = field(init=False, default="cellular")
     rate_bps: float = field(init=False, default=0.0)
 
@@ -191,6 +194,7 @@ class Vehicle:
         center_x = self.rsu_id * self.params.seg_len + self.params.seg_len / 2.0
         horiz = abs(self.s - center_x)
         self.dist_to_rsu_m = math.sqrt(horiz * horiz + self.params.e * self.params.e)
+        self.rsu_coverage_time = (((self.rsu_id + 1) * self.params.seg_len) - self.s) / self.v_ms()
 
     def compute_uplink_rate(self) -> None:
         self.assign_rsu_and_distance()
@@ -497,7 +501,7 @@ def distributed_macter(vehicles: List[Vehicle], rsu_F: float, max_iter: int) -> 
 
     # Compute system computation efficiency (paper Eq 17-ish; we use total chosen utility per total energy)
     total_utility = 0.0
-    total_energy = 0.0
+    total_energy = 1e-12
 
     for v in vehicles:
         if decisions[v.vid] == "vec":
@@ -548,7 +552,29 @@ def group_by_rsu(vehicles: List[Vehicle], M: int) -> Dict[int, List[Vehicle]]:
         groups[v.rsu_id].append(v)
     return groups
 
+def group_by_rsu_extended(vehicles: List[Vehicle], M: int) -> Dict[int, List[Vehicle]]:
+    groups = {m: [] for m in range(M)}
 
+    for v in vehicles:
+        if can_not_offload_to_this_rsu(v):
+            v2 = copy.deepcopy(v)
+            v2.rsu_id += 1
+            v2.s = v2.rsu_id * v.params.seg_len + 1e-3
+            v2.assign_rsu_and_distance()
+            v2.compute_uplink_rate()
+            v2.task.t_max = v.task.t_max - v.rsu_coverage_time
+
+            groups[v2.rsu_id].append(v2)
+        else:
+            groups[v.rsu_id].append(v)
+
+    return groups
+
+def can_not_offload_to_this_rsu(v):
+    transmission_time = v.task.alpha_bits / v.rate_bps
+    minimum_comp_time = v.task.C_Gcycles / v.params.F_vec_total_GHz
+    result = transmission_time + minimum_comp_time > v.rsu_coverage_time > v.local_time() and v.rsu_coverage_time < v.task.t_max
+    return result
 # ----------------------------
 # Main
 # ----------------------------
