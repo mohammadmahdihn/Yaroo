@@ -59,7 +59,7 @@ class SystemParams:
     cellular_range: float = 200.0 # (m)
 
     # RSU compute
-    F_vec_total_GHz: float = 8000.0 # total edge CPU per RSU (GHz)
+    F_vec_total_GHz: float = 80.0 # total edge CPU per RSU (GHz)
 
     # Max RSU data rate cap
     rsu_max_data_rate_bps: float = 1e9
