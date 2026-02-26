@@ -55,7 +55,13 @@ import numpy as np
 def random_offload(vehicles: List[Vehicle], rsu_F: float,
                    seed: Optional[int] = None) -> Tuple[Dict[int, float], Dict[int, str], float]:
     """Each vehicle flips a fair coin: 50 % VEC, 50 % local.
-    VEC vehicles receive equal CPU shares (F_total / #offloaders)."""
+    VEC vehicles receive equal CPU shares (F_total / #offloaders).
+
+    Feasibility check (paper constraint C7): after assigning CPU, any vehicle
+    whose VEC time exceeds its practical tolerable delay t_ptd is moved back
+    to local — matching the behaviour MACTER achieves implicitly via its
+    utility function (infeasible offloads produce negative U_vec < U_loc).
+    """
     rng = random.Random(seed)
     decisions: Dict[int, str] = {}
 
@@ -65,8 +71,20 @@ def random_offload(vehicles: List[Vehicle], rsu_F: float,
         else:
             decisions[v.vid] = "vec" if rng.random() < 0.5 else "loc"
 
+    # First-pass allocation to evaluate feasibility
     offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
     n_off = len(offloaders)
+
+    if n_off > 0:
+        f_each = rsu_F / n_off
+        # C7 check: fall back infeasible vehicles to local, then re-allocate
+        for v in offloaders:
+            if v.vec_time(f_each) > v.practical_tolerable_delay():
+                decisions[v.vid] = "loc"
+
+        # Re-compute with feasible offloaders only
+        offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
+        n_off = len(offloaders)
 
     alloc: Dict[int, float] = {}
     if n_off > 0:
@@ -85,21 +103,46 @@ def all_local(vehicles: List[Vehicle], rsu_F: float) -> Tuple[Dict[int, float], 
 
 
 def all_vec(vehicles: List[Vehicle], rsu_F: float) -> Tuple[Dict[int, float], Dict[int, str], float]:
-    """Reference: all vehicles offload, equal CPU share."""
+    """Reference: all vehicles try to offload, equal CPU share.
+
+    Feasibility check (paper constraint C7): vehicles whose VEC time exceeds
+    t_ptd at the equal-share allocation are moved to local.  This mirrors the
+    implicit feasibility enforcement in MACTER's utility function and ensures
+    a fair comparison.
+    """
     eligible = [v for v in vehicles if v.rate_bps > 0.0]
     ineligible = [v for v in vehicles if v.rate_bps <= 0.0]
 
     decisions: Dict[int, str] = {}
-    for v in eligible:
-        decisions[v.vid] = "vec"
     for v in ineligible:
         decisions[v.vid] = "loc"
 
+    # First-pass: equal share among all eligible
     n = len(eligible)
-    alloc: Dict[int, float] = {}
     if n > 0:
         f_each = rsu_F / n
         for v in eligible:
+            # C7 check
+            if v.vec_time(f_each) <= v.practical_tolerable_delay():
+                decisions[v.vid] = "vec"
+            else:
+                decisions[v.vid] = "loc"
+
+        # Re-allocate among the feasible offloaders
+        feasible = [v for v in eligible if decisions[v.vid] == "vec"]
+        n_f = len(feasible)
+        if n_f > 0:
+            f_each = rsu_F / n_f
+            # Second-pass check with refined allocation
+            for v in feasible:
+                if v.vec_time(f_each) > v.practical_tolerable_delay():
+                    decisions[v.vid] = "loc"
+
+    alloc: Dict[int, float] = {}
+    offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
+    if offloaders:
+        f_each = rsu_F / len(offloaders)
+        for v in offloaders:
             alloc[v.vid] = f_each
 
     return alloc, decisions, _compute_efficiency(vehicles, alloc, decisions)
@@ -301,6 +344,29 @@ def sweep_data_size(alpha_vals_kB, params: SystemParams, N: int = 20, outer_tria
 # Sweep: varying max tolerable delay
 # ══════════════════════════════════════════════════════════════════════════════
 
+def sweep_f_total(f_vals_GHz, params: SystemParams, N: int = 30, outer_trials: int = 8):
+    """Sweep edge CPU budget — shows where the t_ptd feasibility check starts to bite."""
+    results = {k: [] for k in [
+        "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
+        "macter_vr","rand_vr",
+    ]}
+    for f in f_vals_GHz:
+        print(f"  sweep_F: F={f} GHz", flush=True)
+        p = copy.copy(params)
+        p.F_vec_total_GHz = f
+        trial_data = []
+        for t in range(outer_trials):
+            vehicles = make_vehicles(N, p, seed=t * 700 + int(f))
+            trial_data.append(_run_one_scenario(vehicles, p))
+        for k in results:
+            base = k.replace("_std", "")
+            if k.endswith("_std"):
+                results[k].append(_std([d[base] for d in trial_data]))
+            else:
+                results[k].append(_mean([d[k] for d in trial_data]))
+    return results
+
+
 def sweep_tmax(tmax_vals, params: SystemParams, N: int = 20, outer_trials: int = 8):
     results = {k: [] for k in [
         "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
@@ -428,17 +494,22 @@ def build_figure(out_path: str):
     snap_m = [macter_u[i] for i in vids]
     snap_r = [rand_u[i]   for i in vids]
 
-    # ── Experiment 5: convergence (utility vs iteration) ─────────────────────
+    # ── Experiment 5 (new): vary edge CPU budget F_total ────────────────────
+    f_vals = [50, 100, 200, 500, 1000, 2000, 4000, 8000]
+    print("Running sweep: edge CPU budget …")
+    res_F = sweep_f_total(f_vals, params, N=30, outer_trials=8)
+
+    # ── Experiment 6: convergence (utility vs iteration) ─────────────────────
     print("Running convergence trace …")
     conv_data = _convergence_trace(params, N=25, seed=7)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Layout: 3 rows × 2 cols + wide convergence panel + per-vehicle bar
+    # Layout: 5 rows × 2 cols
     # ══════════════════════════════════════════════════════════════════════════
-    fig = plt.figure(figsize=(18, 20))
+    fig = plt.figure(figsize=(18, 25))
     fig.patch.set_facecolor("#f7f9fc")
 
-    gs = gridspec.GridSpec(4, 2, figure=fig,
+    gs = gridspec.GridSpec(5, 2, figure=fig,
                            hspace=0.52, wspace=0.35,
                            top=0.93, bottom=0.05,
                            left=0.07, right=0.97)
@@ -450,8 +521,9 @@ def build_figure(out_path: str):
         fig.add_subplot(gs[1, 1]),   # 3 – efficiency vs tmax
         # fig.add_subplot(gs[2, 0]),   # 4 – avg utility vs tmax
         # fig.add_subplot(gs[2, 1]),   # 5 – VEC offload ratio vs N
-        # fig.add_subplot(gs[3, 0]),   # 6 – convergence
-        # fig.add_subplot(gs[3, 1]),   # 7 – per-vehicle utility bar
+        # fig.add_subplot(gs[3, 0]),   # 6 – efficiency vs F_total (NEW)
+        # fig.add_subplot(gs[3, 1]),   # 7 – convergence
+        # fig.add_subplot(gs[4, :]),   # 8 – per-vehicle utility bar (full width)
     ]
 
     for a in ax:
@@ -547,47 +619,64 @@ def build_figure(out_path: str):
     # ax[5].set_ylim(0, 105)
     # ax[5].legend(fontsize=8.5, framealpha=0.7)
     #
-    # # ── Panel 6: Convergence trace ────────────────────────────────────────────
-    # iters_m, util_m = conv_data["macter_iters"], conv_data["macter_utils"]
-    # iters_r, util_r = conv_data["rand_iters"],   conv_data["rand_utils"]
-    #
-    # ax[6].plot(iters_m, util_m, color=COLORS["macter"], marker="o",
-    #            markersize=5, linewidth=LWIDTH, label="MACTER")
-    # ax[6].axhline(util_r, color=COLORS["random"], linestyle="--",
-    #               linewidth=1.8, label=f"Random baseline ({util_r:.3f})")
-    # ax[6].axhline(conv_data["local_util"], color=COLORS["local"],
-    #               linestyle=":", linewidth=1.8,
-    #               label=f"All-Local ({conv_data['local_util']:.3f})")
-    # ax[6].set_title("MACTER Convergence: Average Utility per Iteration",
+    # # ── Panel 6 (NEW): Efficiency vs Edge CPU Budget F_total ─────────────────
+    # _plot_line(ax[6], f_vals, res_F["macter_eff"], None,
+    #            "macter", "MACTER")
+    # _plot_line(ax[6], f_vals, res_F["rand_eff"],   res_F["rand_eff_std"],
+    #            "random", "Random (w/ C7 check)")
+    # _plot_line(ax[6], f_vals, res_F["local_eff"],  None,
+    #            "local",  "All-Local", linestyle="--")
+    # _plot_line(ax[6], f_vals, res_F["allvec_eff"], None,
+    #            "allvec", "All-VEC (w/ C7 check)", linestyle=":")
+    # ax[6].set_xscale("log")
+    # ax[6].set_title("Computation Efficiency vs. Edge CPU Budget (F_total)\n"
+    #                 "C7 deadline check active — gap widens when CPU is scarce",
     #                 fontweight="bold", fontsize=11)
-    # ax[6].set_xlabel("Iteration")
-    # ax[6].set_ylabel("Average Utility")
+    # ax[6].set_xlabel("Edge CPU Budget F_total (GHz, log scale)")
+    # ax[6].set_ylabel("Computation Efficiency")
     # ax[6].legend(fontsize=8.5, framealpha=0.7)
     #
-    # # ── Panel 7: Per-vehicle utility bar chart ────────────────────────────────
+    # # ── Panel 7: Convergence trace ────────────────────────────────────────────
+    # iters_m, util_m = conv_data["macter_iters"], conv_data["macter_utils"]
+    # util_r = conv_data["rand_utils"]
+    #
+    # ax[7].plot(iters_m, util_m, color=COLORS["macter"], marker="o",
+    #            markersize=5, linewidth=LWIDTH, label="MACTER")
+    # ax[7].axhline(util_r, color=COLORS["random"], linestyle="--",
+    #               linewidth=1.8, label=f"Random baseline ({util_r:.3f})")
+    # ax[7].axhline(conv_data["local_util"], color=COLORS["local"],
+    #               linestyle=":", linewidth=1.8,
+    #               label=f"All-Local ({conv_data['local_util']:.3f})")
+    # ax[7].set_title("MACTER Convergence: Average Utility per Iteration",
+    #                 fontweight="bold", fontsize=11)
+    # ax[7].set_xlabel("Iteration")
+    # ax[7].set_ylabel("Average Utility")
+    # ax[7].legend(fontsize=8.5, framealpha=0.7)
+    #
+    # # ── Panel 8: Per-vehicle utility bar chart (full width) ──────────────────
     # x = np.arange(len(vids))
     # width = 0.38
-    # ax[7].bar(x - width / 2, snap_m, width, color=COLORS["macter"],
+    # ax[8].bar(x - width / 2, snap_m, width, color=COLORS["macter"],
     #           alpha=0.82, label="MACTER", edgecolor="white", linewidth=0.4)
-    # ax[7].bar(x + width / 2, snap_r, width, color=COLORS["random"],
-    #           alpha=0.82, label="Random (avg)", edgecolor="white", linewidth=0.4)
+    # ax[8].bar(x + width / 2, snap_r, width, color=COLORS["random"],
+    #           alpha=0.82, label="Random (avg, w/ C7 check)", edgecolor="white", linewidth=0.4)
     #
-    # # colour the x-tick labels by MACTER decision
-    # ax[7].set_xticks(x)
-    # ax[7].set_xticklabels([f"v{i}" for i in vids], rotation=90, fontsize=6.5)
-    # for tick, vid in zip(ax[7].get_xticklabels(), vids):
+    # ax[8].set_xticks(x)
+    # ax[8].set_xticklabels([f"v{i}" for i in vids], rotation=90, fontsize=6.5)
+    # for tick, vid in zip(ax[8].get_xticklabels(), vids):
     #     tick.set_color(COLORS["macter"] if macter_dec.get(vid) == "vec"
     #                    else COLORS["local"])
     #
-    # ax[7].set_title("Per-Vehicle Utility: MACTER vs Random  (N=30, seed=42)\n"
-    #                 r"  $\bf{blue\ label}$=MACTER VEC,  $\bf{green\ label}$=MACTER Local",
+    # ax[8].set_title("Per-Vehicle Utility: MACTER vs Random  (N=30, seed=42, C7-enforced baselines)\n"
+    #                 r"  $\bf{blue\ label}$=MACTER→VEC,  $\bf{green\ label}$=MACTER→Local",
     #                 fontweight="bold", fontsize=10)
-    # ax[7].set_ylabel("Utility (clamped ≥ 0)")
+    # ax[8].set_ylabel("Utility (clamped ≥ 0)")
     # leg_handles = [
     #     Line2D([0], [0], color=COLORS["macter"], lw=6, alpha=0.7, label="MACTER"),
-    #     Line2D([0], [0], color=COLORS["random"],  lw=6, alpha=0.7, label="Random (avg)"),
+    #     Line2D([0], [0], color=COLORS["random"],  lw=6, alpha=0.7,
+    #            label="Random (avg, w/ C7 check)"),
     # ]
-    # ax[7].legend(handles=leg_handles, fontsize=8.5, framealpha=0.7)
+    # ax[8].legend(handles=leg_handles, fontsize=8.5, framealpha=0.7)
 
     # ── Compute overall improvement stats for super-title ────────────────────
     m_mean_eff = _mean(res_N["macter_eff"])
