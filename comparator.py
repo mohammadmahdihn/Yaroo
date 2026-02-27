@@ -1,25 +1,3 @@
-"""
-MACTER vs Random Baseline — Comparison & Visualization
-=======================================================
-Runs both algorithms across several experiment axes (matching the paper's
-evaluation style) and produces a multi-panel figure.
-
-Experiment axes
----------------
-1. Varying number of vehicles  (Fig 5 / Fig 6 style)
-2. Varying task data size       (Fig 4 style)
-3. Varying max tolerable delay  (Fig 8 style)
-4. Per-vehicle utility scatter  (single snapshot, N=30)
-
-Baseline algorithms compared
------------------------------
-  MACTER  – the fixed distributed MACTER algorithm (Algorithm 2)
-  Random  – each vehicle independently picks loc/vec with prob=0.5;
-             offloaders receive equal-share CPU (F_total / num_offloaders)
-  All-Local  – all vehicles always compute locally (lower bound)
-  All-VEC    – all vehicles always offload; equal-share CPU (upper-bound reference)
-"""
-
 from __future__ import annotations
 
 import copy
@@ -30,7 +8,6 @@ import os
 import statistics
 from typing import Dict, List, Tuple, Optional
 
-# ── import the fixed implementation ────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 from new_money import (
     SystemParams, Vehicle, Task,
@@ -44,45 +21,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from matplotlib.lines import Line2D
 import numpy as np
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Baseline algorithms
-# ══════════════════════════════════════════════════════════════════════════════
-
 def random_offload(vehicles: List[Vehicle], rsu_F: float,
                    seed: Optional[int] = None) -> Tuple[Dict[int, float], Dict[int, str], float]:
-    """Each vehicle flips a fair coin: 50 % VEC, 50 % local.
-    VEC vehicles receive equal CPU shares (F_total / #offloaders).
-
-    Feasibility check (paper constraint C7): after assigning CPU, any vehicle
-    whose VEC time exceeds its practical tolerable delay t_ptd is moved back
-    to local — matching the behaviour MACTER achieves implicitly via its
-    utility function (infeasible offloads produce negative U_vec < U_loc).
-    """
     rng = random.Random(seed)
     decisions: Dict[int, str] = {}
 
     for v in vehicles:
-        if v.rate_bps <= 0.0:          # can't offload without connectivity
+        if v.rate_bps <= 0.0:
             decisions[v.vid] = "loc"
         else:
             decisions[v.vid] = "vec" if rng.random() < 0.5 else "loc"
 
-    # First-pass allocation to evaluate feasibility
     offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
     n_off = len(offloaders)
 
     if n_off > 0:
         f_each = rsu_F / n_off
-        # C7 check: fall back infeasible vehicles to local, then re-allocate
         for v in offloaders:
             if v.vec_time(f_each) > v.practical_tolerable_delay():
                 decisions[v.vid] = "loc"
 
-        # Re-compute with feasible offloaders only
         offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
         n_off = len(offloaders)
 
@@ -96,20 +57,12 @@ def random_offload(vehicles: List[Vehicle], rsu_F: float,
 
 
 def all_local(vehicles: List[Vehicle], rsu_F: float) -> Tuple[Dict[int, float], Dict[int, str], float]:
-    """Lower bound: every vehicle computes locally."""
     decisions = {v.vid: "loc" for v in vehicles}
     alloc: Dict[int, float] = {}
     return alloc, decisions, _compute_efficiency(vehicles, alloc, decisions)
 
 
 def all_vec(vehicles: List[Vehicle], rsu_F: float) -> Tuple[Dict[int, float], Dict[int, str], float]:
-    """Reference: all vehicles try to offload, equal CPU share.
-
-    Feasibility check (paper constraint C7): vehicles whose VEC time exceeds
-    t_ptd at the equal-share allocation are moved to local.  This mirrors the
-    implicit feasibility enforcement in MACTER's utility function and ensures
-    a fair comparison.
-    """
     eligible = [v for v in vehicles if v.rate_bps > 0.0]
     ineligible = [v for v in vehicles if v.rate_bps <= 0.0]
 
@@ -117,23 +70,19 @@ def all_vec(vehicles: List[Vehicle], rsu_F: float) -> Tuple[Dict[int, float], Di
     for v in ineligible:
         decisions[v.vid] = "loc"
 
-    # First-pass: equal share among all eligible
     n = len(eligible)
     if n > 0:
         f_each = rsu_F / n
         for v in eligible:
-            # C7 check
             if v.vec_time(f_each) <= v.practical_tolerable_delay():
                 decisions[v.vid] = "vec"
             else:
                 decisions[v.vid] = "loc"
 
-        # Re-allocate among the feasible offloaders
         feasible = [v for v in eligible if decisions[v.vid] == "vec"]
         n_f = len(feasible)
         if n_f > 0:
             f_each = rsu_F / n_f
-            # Second-pass check with refined allocation
             for v in feasible:
                 if v.vec_time(f_each) > v.practical_tolerable_delay():
                     decisions[v.vid] = "loc"
@@ -148,9 +97,6 @@ def all_vec(vehicles: List[Vehicle], rsu_F: float) -> Tuple[Dict[int, float], Di
     return alloc, decisions, _compute_efficiency(vehicles, alloc, decisions)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Shared metric helpers
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _compute_efficiency(vehicles: List[Vehicle],
                         alloc: Dict[int, float],
@@ -203,15 +149,11 @@ def _avg_delay(vehicles: List[Vehicle],
     return statistics.mean(vals) if vals else 0.0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Run helpers: sweep over one axis, repeat trials, average
-# ══════════════════════════════════════════════════════════════════════════════
-
-TRIALS = 10  # Monte-Carlo trials per data point
+TRIALS = 10
 
 
-def _run_one_scenario(vehicles: List[Vehicle], params: SystemParams) -> dict:
-    """Run all four algorithms on a pre-built vehicle list; return metric dict."""
+def _run_one_scenario(vehicles: List[Vehicle], params: SystemParams, run_seed: int = 0) -> dict:
+
     groups = group_by_rsu(vehicles, params.M)
     vehicles_copy = copy.deepcopy(vehicles)
     groups_ext = group_by_rsu_extended(vehicles_copy, params.M)
@@ -241,14 +183,14 @@ def _run_one_scenario(vehicles: List[Vehicle], params: SystemParams) -> dict:
         m_vratio.append(_vec_ratio(dec))
         m_delay.append(_avg_delay(vs, alloc, dec))
 
-    # ── Random (average over several coin-flip seeds) ─────────────────────────
+    # ── Random ─────────────────────────
     r_eff_t, r_util_t, r_vratio_t, r_delay_t = [], [], [], []
     for trial in range(TRIALS):
         t_eff, t_util, t_vr, t_delay = [], [], [], []
         for vs in groups.values():
             if not vs:
                 continue
-            alloc, dec, eff = random_offload(vs, params.F_vec_total_GHz, seed=trial)
+            alloc, dec, eff = random_offload(vs, params.F_vec_total_GHz, seed=(run_seed + trial) % (2**31))
             t_eff.append(eff)
             t_util.append(_avg_utility(vs, alloc, dec))
             t_vr.append(_vec_ratio(dec))
@@ -304,11 +246,7 @@ def _std(lst):
     return statistics.stdev(lst) if len(lst) > 1 else 0.0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Sweep: varying number of vehicles
-# ══════════════════════════════════════════════════════════════════════════════
-
-def sweep_num_vehicles(N_vals, params: SystemParams, outer_trials: int = 8):
+def sweep_num_vehicles(N_vals, params: SystemParams, outer_trials: int = 8, run_seed: int = 0):
     results = {k: [] for k in [
         "macter_eff","macter_ex_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
         "macter_util","macter_ex_util","rand_util","rand_util_std","local_util","allvec_util",
@@ -316,27 +254,22 @@ def sweep_num_vehicles(N_vals, params: SystemParams, outer_trials: int = 8):
     ]}
     for N in N_vals:
         print(f"  sweep_N: N={N}", flush=True)
-        # Average over outer_trials independent vehicle placements
         trial_data = []
         for t in range(outer_trials):
-            vehicles = make_vehicles(N, params, seed=t * 1000 + N)
-            trial_data.append(_run_one_scenario(vehicles, params))
+            vehicles = make_vehicles(N, params, seed=(run_seed + t * 1000 + N) % (2**31))
+            trial_data.append(_run_one_scenario(vehicles, params, run_seed=run_seed))
 
         for k in results:
             base = k.replace("_std", "")
             if k.endswith("_std"):
-                # std across outer trials of the mean metric
                 results[k].append(_std([d[base] for d in trial_data]))
             else:
                 results[k].append(_mean([d[k] for d in trial_data]))
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Sweep: varying data size
-# ══════════════════════════════════════════════════════════════════════════════
 
-def sweep_data_size(alpha_vals_kB, params: SystemParams, N: int = 20, outer_trials: int = 8):
+def sweep_data_size(alpha_vals_kB, params: SystemParams, N: int = 20, outer_trials: int = 8, run_seed: int = 0):
     results = {k: [] for k in [
         "macter_ex_eff","macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
     ]}
@@ -347,8 +280,8 @@ def sweep_data_size(alpha_vals_kB, params: SystemParams, N: int = 20, outer_tria
         p.alpha_kB_max = a * 1.15
         trial_data = []
         for t in range(outer_trials):
-            vehicles = make_vehicles(N, p, seed=t * 500 + int(a))
-            trial_data.append(_run_one_scenario(vehicles, p))
+            vehicles = make_vehicles(N, p, seed=(run_seed + t * 500 + int(a)) % (2**31))
+            trial_data.append(_run_one_scenario(vehicles, p, run_seed=run_seed))
         for k in results:
             base = k.replace("_std", "")
             if k.endswith("_std"):
@@ -358,11 +291,7 @@ def sweep_data_size(alpha_vals_kB, params: SystemParams, N: int = 20, outer_tria
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Sweep: varying max tolerable delay
-# ══════════════════════════════════════════════════════════════════════════════
-
-def sweep_f_total(f_vals_GHz, params: SystemParams, N: int = 30, outer_trials: int = 8):
+def sweep_f_total(f_vals_GHz, params: SystemParams, N: int = 30, outer_trials: int = 8, run_seed: int = 0):
     """Sweep edge CPU budget — shows where the t_ptd feasibility check starts to bite."""
     results = {k: [] for k in [
         "macter_ex_eff","macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
@@ -374,8 +303,8 @@ def sweep_f_total(f_vals_GHz, params: SystemParams, N: int = 30, outer_trials: i
         p.F_vec_total_GHz = f
         trial_data = []
         for t in range(outer_trials):
-            vehicles = make_vehicles(N, p, seed=t * 700 + int(f))
-            trial_data.append(_run_one_scenario(vehicles, p))
+            vehicles = make_vehicles(N, p, seed=(run_seed + t * 700 + int(f)) % (2**31))
+            trial_data.append(_run_one_scenario(vehicles, p, run_seed=run_seed))
         for k in results:
             base = k.replace("_std", "")
             if k.endswith("_std"):
@@ -385,7 +314,7 @@ def sweep_f_total(f_vals_GHz, params: SystemParams, N: int = 30, outer_trials: i
     return results
 
 
-def sweep_tmax(tmax_vals, params: SystemParams, N: int = 20, outer_trials: int = 8):
+def sweep_tmax(tmax_vals, params: SystemParams, N: int = 20, outer_trials: int = 8, run_seed: int = 0):
     results = {k: [] for k in [
         "macter_ex_eff", "macter_eff","rand_eff","rand_eff_std","local_eff","allvec_eff",
         "macter_ex_util", "macter_util","rand_util","rand_util_std","local_util","allvec_util",
@@ -397,8 +326,8 @@ def sweep_tmax(tmax_vals, params: SystemParams, N: int = 20, outer_trials: int =
         p.tmax_max = tmax * 1.3
         trial_data = []
         for t in range(outer_trials):
-            vehicles = make_vehicles(N, p, seed=t * 300 + int(tmax * 100))
-            trial_data.append(_run_one_scenario(vehicles, p))
+            vehicles = make_vehicles(N, p, seed=(run_seed + t * 300 + int(tmax * 100)) % (2**31))
+            trial_data.append(_run_one_scenario(vehicles, p, run_seed=run_seed))
         for k in results:
             base = k.replace("_std", "")
             if k.endswith("_std"):
@@ -408,11 +337,7 @@ def sweep_tmax(tmax_vals, params: SystemParams, N: int = 20, outer_trials: int =
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Per-vehicle snapshot
-# ══════════════════════════════════════════════════════════════════════════════
-
-def per_vehicle_snapshot(vehicles: List[Vehicle], params: SystemParams):
+def per_vehicle_snapshot(vehicles: List[Vehicle], params: SystemParams, run_seed: int = 0):
     groups = group_by_rsu(vehicles, params.M)
 
     macter_u: Dict[int, float] = {}
@@ -430,7 +355,7 @@ def per_vehicle_snapshot(vehicles: List[Vehicle], params: SystemParams):
         rand_dec_majority: Dict[int, Dict[str, int]] = {v.vid: {"vec": 0, "loc": 0} for v in vs}
 
         for trial in range(20):
-            alloc_r, dec_r, _ = random_offload(vs, params.F_vec_total_GHz, seed=trial)
+            alloc_r, dec_r, _ = random_offload(vs, params.F_vec_total_GHz, seed=(run_seed + trial) % (2**31))
             for v in vs:
                 if dec_r[v.vid] == "vec":
                     u = utility_vec(v, alloc_r.get(v.vid, 0.0))
@@ -454,9 +379,6 @@ def per_vehicle_snapshot(vehicles: List[Vehicle], params: SystemParams):
     return macter_u, rand_u, macter_dec, rand_dec
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Styling helpers
-# ══════════════════════════════════════════════════════════════════════════════
 
 COLORS = {
     "macter":  "#1a6faf",
@@ -483,32 +405,30 @@ def _plot_line(ax, x, y, yerr, key, label, linestyle="-", alpha_fill=0.12):
                         color=c, alpha=alpha_fill, zorder=2)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Build the figure
-# ══════════════════════════════════════════════════════════════════════════════
 
-def build_figure(out_path: str):
+def build_figure(out_path: str, run_seed: int = 0):
     params = SystemParams()
 
     # ── Experiment 1: vary N ──────────────────────────────────────────────────
     N_vals = [5, 10, 15, 20, 25, 30, 40, 50]
     print("Running sweep: num_vehicles …")
-    res_N = sweep_num_vehicles(N_vals, params, outer_trials=8)
+    res_N = sweep_num_vehicles(N_vals, params, outer_trials=8, run_seed=run_seed)
 
     # ── Experiment 2: vary data size ──────────────────────────────────────────
     alpha_vals = [10, 20, 30, 40, 50, 60, 70, 80]
     print("Running sweep: data size …")
-    res_alpha = sweep_data_size(alpha_vals, params, N=20, outer_trials=8)
+    res_alpha = sweep_data_size(alpha_vals, params, N=20, outer_trials=8, run_seed=run_seed)
 
     # ── Experiment 3: vary tmax ───────────────────────────────────────────────
-    tmax_vals = [0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0]
+    tmax_vals = [0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
     print("Running sweep: max tolerable delay …")
-    res_tmax = sweep_tmax(tmax_vals, params, N=20, outer_trials=8)
+    res_tmax = sweep_tmax(tmax_vals, params, N=20, outer_trials=8, run_seed=run_seed)
 
     # ── Experiment 4: per-vehicle snapshot ───────────────────────────────────
     print("Running per-vehicle snapshot …")
-    vehicles_snap = make_vehicles(30, params, seed=42)
-    macter_u, rand_u, macter_dec, rand_dec = per_vehicle_snapshot(vehicles_snap, params)
+    snap_seed = (run_seed + 99991) % (2**31)
+    vehicles_snap = make_vehicles(30, params, seed=snap_seed)
+    macter_u, rand_u, macter_dec, rand_dec = per_vehicle_snapshot(vehicles_snap, params, run_seed=run_seed)
     vids = sorted(macter_u.keys())
     snap_m = [macter_u[i] for i in vids]
     snap_r = [rand_u[i]   for i in vids]
@@ -523,10 +443,10 @@ def build_figure(out_path: str):
                            left=0.07, right=0.97)
 
     ax = [
-        fig.add_subplot(gs[0, 0]),   # 0 – efficiency vs N
-        fig.add_subplot(gs[0, 1]),   # 1 – avg utility vs N
-        fig.add_subplot(gs[1, 0]),   # 2 – efficiency vs data size
-        fig.add_subplot(gs[1, 1]),   # 3 – efficiency vs tmax
+        fig.add_subplot(gs[0, 0]),
+        fig.add_subplot(gs[0, 1]),
+        fig.add_subplot(gs[1, 0]),
+        fig.add_subplot(gs[1, 1]),
     ]
 
     for a in ax:
@@ -602,93 +522,6 @@ def build_figure(out_path: str):
     ax[3].set_ylabel("Computation Efficiency")
     ax[3].legend(fontsize=8.5, framealpha=0.7)
 
-    # # ── Panel 4: Avg Utility vs tmax ──────────────────────────────────────────
-    # _plot_line(ax[4], tmax_vals, res_tmax["macter_util"], None,
-    #            "macter", "MACTER")
-    # _plot_line(ax[4], tmax_vals, res_tmax["rand_util"],   res_tmax["rand_util_std"],
-    #            "random", "Random")
-    # _plot_line(ax[4], tmax_vals, res_tmax["local_util"],  None,
-    #            "local",  "All-Local", linestyle="--")
-    # _plot_line(ax[4], tmax_vals, res_tmax["allvec_util"], None,
-    #            "allvec", "All-VEC",   linestyle=":")
-    # ax[4].set_title("Average Vehicle Utility vs. Max Tolerable Delay",
-    #                 fontweight="bold", fontsize=11)
-    # ax[4].set_xlabel("Max Tolerable Delay t_max (s)")
-    # ax[4].set_ylabel("Average Utility")
-    # ax[4].legend(fontsize=8.5, framealpha=0.7)
-    #
-    # # ── Panel 5: VEC Offload Ratio vs N ──────────────────────────────────────
-    # ax[5].plot(N_vals, [v * 100 for v in res_N["macter_vr"]],
-    #            color=COLORS["macter"], marker=MARKERS["macter"],
-    #            markersize=MSIZE, linewidth=LWIDTH, label="MACTER")
-    # ax[5].axhline(50, color=COLORS["random"], linestyle="--", linewidth=1.6,
-    #               label="Random (50 % by design)")
-    # ax[5].set_title("VEC Offload Ratio vs. Number of Vehicles",
-    #                 fontweight="bold", fontsize=11)
-    # ax[5].set_xlabel("Number of Vehicles (N)")
-    # ax[5].set_ylabel("VEC Offload Ratio (%)")
-    # ax[5].set_ylim(0, 105)
-    # ax[5].legend(fontsize=8.5, framealpha=0.7)
-    #
-    # # ── Panel 6 (NEW): Efficiency vs Edge CPU Budget F_total ─────────────────
-    # _plot_line(ax[6], f_vals, res_F["macter_eff"], None,
-    #            "macter", "MACTER")
-    # _plot_line(ax[6], f_vals, res_F["rand_eff"],   res_F["rand_eff_std"],
-    #            "random", "Random (w/ C7 check)")
-    # _plot_line(ax[6], f_vals, res_F["local_eff"],  None,
-    #            "local",  "All-Local", linestyle="--")
-    # _plot_line(ax[6], f_vals, res_F["allvec_eff"], None,
-    #            "allvec", "All-VEC (w/ C7 check)", linestyle=":")
-    # ax[6].set_xscale("log")
-    # ax[6].set_title("Computation Efficiency vs. Edge CPU Budget (F_total)\n"
-    #                 "C7 deadline check active — gap widens when CPU is scarce",
-    #                 fontweight="bold", fontsize=11)
-    # ax[6].set_xlabel("Edge CPU Budget F_total (GHz, log scale)")
-    # ax[6].set_ylabel("Computation Efficiency")
-    # ax[6].legend(fontsize=8.5, framealpha=0.7)
-    #
-    # # ── Panel 7: Convergence trace ────────────────────────────────────────────
-    # iters_m, util_m = conv_data["macter_iters"], conv_data["macter_utils"]
-    # util_r = conv_data["rand_utils"]
-    #
-    # ax[7].plot(iters_m, util_m, color=COLORS["macter"], marker="o",
-    #            markersize=5, linewidth=LWIDTH, label="MACTER")
-    # ax[7].axhline(util_r, color=COLORS["random"], linestyle="--",
-    #               linewidth=1.8, label=f"Random baseline ({util_r:.3f})")
-    # ax[7].axhline(conv_data["local_util"], color=COLORS["local"],
-    #               linestyle=":", linewidth=1.8,
-    #               label=f"All-Local ({conv_data['local_util']:.3f})")
-    # ax[7].set_title("MACTER Convergence: Average Utility per Iteration",
-    #                 fontweight="bold", fontsize=11)
-    # ax[7].set_xlabel("Iteration")
-    # ax[7].set_ylabel("Average Utility")
-    # ax[7].legend(fontsize=8.5, framealpha=0.7)
-    #
-    # # ── Panel 8: Per-vehicle utility bar chart (full width) ──────────────────
-    # x = np.arange(len(vids))
-    # width = 0.38
-    # ax[8].bar(x - width / 2, snap_m, width, color=COLORS["macter"],
-    #           alpha=0.82, label="MACTER", edgecolor="white", linewidth=0.4)
-    # ax[8].bar(x + width / 2, snap_r, width, color=COLORS["random"],
-    #           alpha=0.82, label="Random (avg, w/ C7 check)", edgecolor="white", linewidth=0.4)
-    #
-    # ax[8].set_xticks(x)
-    # ax[8].set_xticklabels([f"v{i}" for i in vids], rotation=90, fontsize=6.5)
-    # for tick, vid in zip(ax[8].get_xticklabels(), vids):
-    #     tick.set_color(COLORS["macter"] if macter_dec.get(vid) == "vec"
-    #                    else COLORS["local"])
-    #
-    # ax[8].set_title("Per-Vehicle Utility: MACTER vs Random  (N=30, seed=42, C7-enforced baselines)\n"
-    #                 r"  $\bf{blue\ label}$=MACTER→VEC,  $\bf{green\ label}$=MACTER→Local",
-    #                 fontweight="bold", fontsize=10)
-    # ax[8].set_ylabel("Utility (clamped ≥ 0)")
-    # leg_handles = [
-    #     Line2D([0], [0], color=COLORS["macter"], lw=6, alpha=0.7, label="MACTER"),
-    #     Line2D([0], [0], color=COLORS["random"],  lw=6, alpha=0.7,
-    #            label="Random (avg, w/ C7 check)"),
-    # ]
-    # ax[8].legend(handles=leg_handles, fontsize=8.5, framealpha=0.7)
-
     # ── Compute overall improvement stats for super-title ────────────────────
     m_mean_eff = _mean(res_N["macter_eff"])
     r_mean_eff = _mean(res_N["rand_eff"])
@@ -708,29 +541,22 @@ def build_figure(out_path: str):
     return pct_vs_rand, pct_vs_local
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Convergence trace helper
-# ══════════════════════════════════════════════════════════════════════════════
 
-def _convergence_trace(params: SystemParams, N: int = 25, seed: int = 7) -> dict:
-    """Replicate Algorithm 2 step-by-step and record avg utility at each iteration."""
+def _convergence_trace(params: SystemParams, N: int = 25, seed: int = 7, run_seed: int = 0) -> dict:
     from new_money import (
         algorithm1_resource_allocation_and_choice,
         allocate_edge_cpu_bisection,
     )
 
-    vehicles = make_vehicles(N, params, seed=seed)
+    vehicles = make_vehicles(N, params, seed=(run_seed + seed) % (2**31))
     groups   = group_by_rsu(vehicles, params.M)
 
-    # We'll run MACTER on the largest RSU group for clarity
     all_vs = max(groups.values(), key=len)
     if len(all_vs) < 2:
-        # fallback: use all vehicles as one group
         all_vs = vehicles
 
     rsu_F = params.F_vec_total_GHz
 
-    # Initial allocation
     alloc, decisions, _ = algorithm1_resource_allocation_and_choice(all_vs, rsu_F)
     iters_util = [_avg_utility(all_vs, alloc, decisions)]
     iters      = [0]
@@ -764,10 +590,9 @@ def _convergence_trace(params: SystemParams, N: int = 25, seed: int = 7) -> dict
         if not changed or decisions == prev:
             break
 
-    # Random and all-local baselines for the same vehicle set
     rand_utils = []
     for t in range(30):
-        al, dc, _ = random_offload(all_vs, rsu_F, seed=t)
+        al, dc, _ = random_offload(all_vs, rsu_F, seed=(run_seed + t) % (2**31))
         rand_utils.append(_avg_utility(all_vs, al, dc))
 
     al_loc, dc_loc, _ = all_local(all_vs, rsu_F)
@@ -782,13 +607,18 @@ def _convergence_trace(params: SystemParams, N: int = 25, seed: int = 7) -> dict
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    run_seed = int.from_bytes(os.urandom(4), "big")
+    print(f"Run seed: {run_seed}  (re-run with RUN_SEED={run_seed} to reproduce)")
+
+    env_seed = os.environ.get("RUN_SEED")
+    if env_seed is not None:
+        run_seed = int(env_seed)
+        print(f"  (overridden by RUN_SEED env var → {run_seed})")
+
     out = "macter_vs_random.png"
-    pct_rand, pct_local = build_figure(out)
+    pct_rand, pct_local = build_figure(out, run_seed=run_seed)
     print(f"\n{'='*60}")
     print(f"  MACTER vs Random  : +{pct_rand:.1f}% mean computation efficiency")
     print(f"  MACTER vs All-Local: +{pct_local:.1f}% mean computation efficiency")

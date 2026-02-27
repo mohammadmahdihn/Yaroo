@@ -1,18 +1,3 @@
-"""
-MACTER (Mobility-Aware Computational Efficiency-Based Task Offloading and Resource Allocation)
-Based on: "Task Offloading and Resource Allocation for IoV Using 5G NR-V2X Communication" (IEEE IoTJ 2022)
-
-This file implements:
-- Mobility model (truncated Gaussian speed, stay time)
-- 5G NR-V2X V2I comm model: cellular + mmWave (rate depends on distance)
-- Computation model: local vs VEC (time + energy)
-- Utility functions (paper Eq. 15,16 style)
-- Algorithm 1: resource allocation (KKT + bisection on lambda) + offloading choice
-- Algorithm 2: distributed MACTER (iterative strategy updates)
-
-No SciPy required.
-"""
-
 from __future__ import annotations
 
 import copy
@@ -22,9 +7,6 @@ import random
 from typing import Dict, List, Tuple, Optional
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -40,20 +22,15 @@ def log2(x: float) -> float:
     return math.log(x, 2)
 
 def trunc_gauss(mu: float, sigma: float, lo: float, hi: float) -> float:
-    # rejection sampling
     while True:
         x = random.gauss(mu, sigma)
         if lo <= x <= hi:
             return x
 
 
-# ----------------------------
-# Parameters
-# ----------------------------
 
 @dataclass
 class SystemParams:
-    # Topology
     M: int = 5                    # RSUs
     r: float = 200.0              # RSU comm "radius" (m)
     e: float = 100.0              # vertical distance road-RSU (m)
@@ -66,20 +43,20 @@ class SystemParams:
     # Max RSU data rate cap
     rsu_max_data_rate_bps: float = 1e9
 
-    # Cellular comm
-    W_uu: float = 20e6                      # Hz
+    # Cellular communication
+    W_uu: float = 20e6
     cellular_path_loss_exp: float = 3.2
     N0_dbm_per_hz: float = -174.0
     NF_cell_db: float = 7.0
 
-    # mmWave comm
-    W_mm: float = 200e6                     # Hz
+    # mmWave communication
+    W_mm: float = 200e6
     mmwave_path_loss_exp: float = 3.2
     NF_mm_db: float = 7.0
     shadow_fading_db: float = 3.0
     G_vehicle_db: float = 15.0
     G_rsu_db: float = 15.0
-    pl_const_db: float = 69.6               # from paper Eq(7)
+    pl_const_db: float = 69.6
 
     # Task and compute
     alpha_kB_min: float = 20.0
@@ -91,8 +68,8 @@ class SystemParams:
     f_loc_min: float = 10.0    # GHz
     f_loc_max: float = 15.0    # GHz
 
-    # Vehicle mobility (km/h)
-    mu_kmh: float = 60.0
+    # Vehicle speed (km/h)
+    mu_kmh: float = 150.0
     sigma_kmh: float = 10.0
 
     # Energy model
@@ -114,14 +91,9 @@ class SystemParams:
     max_lambda: float = 1e6
     max_iter_algo2: int = 50
 
-    # A pragmatic "budget" factor when paper doesn't specify hard max energy for offloading
-    # e_vec_max = offload_energy_budget_factor * e_vec (makes constraint meaningful)
-    offload_energy_budget_factor: float = 2.0
-
     # Segment length along road for each RSU coverage
     @property
     def seg_len(self) -> float:
-        # horizontal chord length for coverage given radius r and vertical offset e
         return 2.0 * math.sqrt(max(self.r * self.r - self.e * self.e, 1e-9))
 
     @property
@@ -137,10 +109,6 @@ class SystemParams:
         return self.mu_kmh + 3.0 * self.sigma_kmh
 
 
-# ----------------------------
-# Models
-# ----------------------------
-
 @dataclass
 class Task:
     alpha_kB: float
@@ -153,7 +121,6 @@ class Task:
 
     @property
     def C_Gcycles(self) -> float:
-        # Ci = xi * alpha_in (paper), with units consistent with GHz CPU
         return self.xi_Gcycles_per_kB * self.alpha_kB
 
 
@@ -161,13 +128,12 @@ class Task:
 class Vehicle:
     vid: int
     params: SystemParams
-    s: float  # position along road (m)
+    s: float  # position
     v_kmh: float
     f_loc_GHz: float
     zeta_J_per_cycle: float
     task: Task
 
-    # computed each snapshot
     rsu_id: int = field(init=False, default=0)
     dist_to_rsu_m: float = field(init=False, default=0.0)
     rsu_coverage_time: float = field(init=False, default=0.0)
@@ -178,19 +144,16 @@ class Vehicle:
         return self.v_kmh * 1000.0 / 3600.0
 
     def stay_time(self) -> float:
-        # paper Eq(3): 2*sqrt(r^2 - e^2) / v
         return self.params.seg_len / max(self.v_ms(), 1e-6)
 
     def practical_tolerable_delay(self) -> float:
         return min(self.task.t_max, self.stay_time())
 
     def assign_rsu_and_distance(self) -> None:
-        # which RSU segment
         seg = int(self.s / self.params.seg_len)
         seg = clamp(seg, 0, self.params.M - 1)
         self.rsu_id = int(seg)
 
-        # center of that RSU segment along the road
         center_x = self.rsu_id * self.params.seg_len + self.params.seg_len / 2.0
         horiz = abs(self.s - center_x)
         self.dist_to_rsu_m = math.sqrt(horiz * horiz + self.params.e * self.params.e)
@@ -201,7 +164,6 @@ class Vehicle:
 
         d = max(self.dist_to_rsu_m, 1.0)
 
-        # choose link based on distance: mmWave preferred within its range
         if d <= self.params.mmwave_range:
             self.link_type = "mmwave"
             rate = self._rate_mmwave(d)
@@ -215,19 +177,15 @@ class Vehicle:
         self.rate_bps = min(rate, self.params.rsu_max_data_rate_bps)
 
     def _rate_cellular(self, d: float) -> float:
-        # paper Eq(4) style: W log2(1 + SNR)
-        # noise power: N0 + NF + 10log10(W)
         noise_dbm = self.params.N0_dbm_per_hz + self.params.NF_cell_db + 10.0 * math.log10(self.params.W_uu)
         noise_w = 10.0 ** ((noise_dbm - 30.0) / 10.0)
 
-        # Rayleigh fading |h|^2 ~ exp(1)
-        h_abs_sq = random.expovariate(1.0)
+        h_abs_sq = random.expovariate(1.0)         # Rayleigh fading
 
         snr = (self.params.p_tx_w * (d ** (-self.params.cellular_path_loss_exp)) * h_abs_sq) / max(noise_w, 1e-18)
         return self.params.W_uu * log2(1.0 + snr)
 
     def _rate_mmwave(self, d: float) -> float:
-        # paper Eq(6)(7) style in dB
         p_dbm = w_to_dbm(self.params.p_tx_w)
         noise_dbm = self.params.N0_dbm_per_hz + self.params.NF_mm_db + 10.0 * math.log10(self.params.W_mm)
 
@@ -237,15 +195,12 @@ class Vehicle:
         snr_lin = db_to_linear(snr_db)
         return self.params.W_mm * log2(1.0 + snr_lin)
 
-    # -------- local compute --------
     def local_time(self) -> float:
         return self.task.C_Gcycles / max(self.f_loc_GHz, 1e-9)
 
     def local_energy_J(self) -> float:
-        # e_loc = zeta * cycles, cycles = C_Gcycles * 1e9
         return self.zeta_J_per_cycle * (self.task.C_Gcycles * 1e9)
 
-    # -------- edge compute --------
     def vec_time(self, f_vec_GHz: float) -> float:
         if self.rate_bps <= 0.0:
             return float("inf")
@@ -256,18 +211,12 @@ class Vehicle:
     def vec_energy_J(self) -> float:
         if self.rate_bps <= 0.0:
             return float("inf")
-        # paper Eq(11): p * alpha / gamma
         return self.params.p_tx_w * (self.task.alpha_bits / self.rate_bps)
 
-
-# ----------------------------
-# Utility functions (paper-like)
-# ----------------------------
 
 def utility_local(v: Vehicle) -> float:
     p = v.params
     K_loc = p.wE * v.local_energy_J() + p.wT * v.local_time()
-    # max energy for local: use worst zeta (paper hint)
     e_loc_max = p.zeta_max * (v.task.C_Gcycles * 1e9)
     X_loc = p.wE * e_loc_max + p.wT * v.task.t_max
 
@@ -283,22 +232,7 @@ def utility_vec(v: Vehicle, f_vec_GHz: float) -> float:
 
     K_vec = p.wE * v.vec_energy_J() + p.wT * v.vec_time(f_vec_GHz)
 
-    # FIX: e_vec_max is the vehicle's MAX ENERGY BUDGET for this task, i.e., the
-    # maximum energy the vehicle is allowed to spend while offloading.
-    # The paper states it is "highly dependent on transmission rate", but its role
-    # in the utility (as an upper bound in the slack) is analogous to e_loc_max:
-    # it is the worst-case / maximum-allowed energy expenditure for the task.
-    # Using zeta_max * C puts it on the same scale as e_loc_max, making
-    # utility_vec and utility_local comparable -- which is required for a meaningful
-    # offloading decision.
-    #
-    # BUG THAT WAS HERE:
-    #   e_vec_max = budget_factor * vec_energy_J()          <- ~2 * e_vec (milliJoules)
-    #               + alpha_bits/rate_bps * p_tx_w          <- + e_vec AGAIN (double-count)
-    # This made e_vec_max ≈ 3 * e_vec ≈ 12 mJ, which is ~3000x smaller than
-    # e_loc_max (~36 J).  Consequently X_vec ≈ 0.26 vs X_loc ≈ 18.25, making
-    # the VEC slack (≈0.013) negligible and utility_vec always << utility_local.
-    e_vec_max = p.zeta_max * (v.task.C_Gcycles * 1e9)   # same scale as e_loc_max
+    e_vec_max = p.zeta_max * (v.task.C_Gcycles * 1e9)
     X_vec = p.wE * e_vec_max + p.wT * v.practical_tolerable_delay()
 
     slack = X_vec - K_vec
@@ -307,63 +241,39 @@ def utility_vec(v: Vehicle, f_vec_GHz: float) -> float:
     return sat - cost
 
 
-# ----------------------------
-# Algorithm 1: Resource allocation (KKT + bisection)
-# ----------------------------
-
 def _f_opt_for_lambda(v: Vehicle, lam: float) -> float:
-    """
-    Closed-form from KKT for our paper-consistent objective.
-    Derived using:
-      U_vec = theta*ln(1 + (X - K)^+) - (1-theta)*rho*f
-      K depends on f via C/f term.
-    """
     p = v.params
     if v.rate_bps <= 0.0:
         return 0.0
 
-    # FIX: use the same corrected e_vec_max as in utility_vec.
-    # OLD (buggy): e_vec_max = budget_factor*e_vec + e_vec  (double-count, milliJoule scale)
-    # This made A tiny (~0.25), so C_i/A was large (~24 GHz), and the KKT f
-    # often barely satisfied or failed the slack check, forcing the return of 0.
-    # With the fix, A is dominated by wE*e_loc_max (~18), so C_i/A ~0.33 GHz and
-    # virtually every reasonable allocation yields positive slack.
     e_vec     = v.vec_energy_J()
-    e_vec_max = v.params.zeta_max * (v.task.C_Gcycles * 1e9)   # same scale as e_loc_max
+    e_vec_max = v.params.zeta_max * (v.task.C_Gcycles * 1e9)
     t_ptd     = v.practical_tolerable_delay()
     tx_time   = v.task.alpha_bits / v.rate_bps
 
     A = p.wE * (e_vec_max - e_vec) + p.wT * (t_ptd - tx_time)
     C_i = p.wT * v.task.C_Gcycles
 
-    # If A <= 0, even infinite CPU can't make slack positive -> no point allocating
     if A <= 0.0 or C_i <= 0.0:
         return 0.0
 
-    # KKT leads to:
-    # f = ( C_i + sqrt(C_i^2 + 4*(1+A)*theta*C_i / ((1-theta)*rho + lam)) ) / (2*(1+A))
-    denom = (1.0 - p.theta) * p.rho_vec + lam
-    if denom <= 0.0:
-        denom = 1e-12
+    denominator = (1.0 - p.theta) * p.rho_vec + lam
+    if denominator <= 0.0:
+        denominator = 1e-12
 
     a = 1.0 + A
-    inside = C_i * C_i + 4.0 * a * p.theta * C_i / denom
+    inside = C_i * C_i + 4.0 * a * p.theta * C_i / denominator
     f = (C_i + math.sqrt(max(inside, 0.0))) / (2.0 * a)
 
-    # Ensure f yields positive slack (otherwise utility is just cost, so clamp to 0)
     if A - C_i / max(f, 1e-12) <= 0.0:
         return 0.0
 
     return max(f, 0.0)
 
 def allocate_edge_cpu_bisection(vehicles_offload: List[Vehicle], F_total_GHz: float, tol: float) -> Dict[int, float]:
-    """
-    Bisection on lambda so sum f_i <= F_total.
-    """
     if not vehicles_offload:
         return {}
 
-    # Find lambda_high such that sum f(lambda_high) <= F_total
     lam_low = 0.0
     lam_high = 1.0
     for _ in range(60):
@@ -374,13 +284,11 @@ def allocate_edge_cpu_bisection(vehicles_offload: List[Vehicle], F_total_GHz: fl
         if lam_high > 1e12:
             break
 
-    # Bisection
     for _ in range(80):
         lam_mid = 0.5 * (lam_low + lam_high)
         s = sum(_f_opt_for_lambda(v, lam_mid) for v in vehicles_offload)
 
         if abs(s - F_total_GHz) <= tol:
-            lam_low = lam_mid
             break
 
         if s > F_total_GHz:
@@ -388,30 +296,14 @@ def allocate_edge_cpu_bisection(vehicles_offload: List[Vehicle], F_total_GHz: fl
         else:
             lam_high = lam_mid
 
-    lam_star = lam_high  # FIX: lam_low gives sum slightly > F_total (over-allocation).
-    # lam_high is the smallest lambda where sum <= F_total,
-    # which properly satisfies the resource constraint C3.
+    lam_star = lam_high
     alloc = {v.vid: _f_opt_for_lambda(v, lam_star) for v in vehicles_offload}
 
-    # If numerical slack leaves unused CPU, that's fine. (paper uses <= constraint)
     return alloc
 
 
-# ----------------------------
-# Algorithm 1 wrapper: allocation + per-vehicle offload choice
-# ----------------------------
 
 def algorithm1_resource_allocation_and_choice(vehicles: List[Vehicle], rsu_F: float) -> Tuple[Dict[int, float], Dict[int, str], Dict[int, Tuple[float, float]]]:
-    """
-    Runs resource allocation assuming current offload set is "all vehicles try VEC".
-    Then computes U_loc and U_vec and picks best per vehicle.
-
-    Returns:
-      f_alloc (only for those choosing vec),
-      decisions: vid -> "loc"/"vec"
-      utilities: vid -> (U_loc, U_vec_used)
-    """
-    # Allocate edge CPU as if everyone offloads (Algorithm 1's first stage vibe)
     alloc_all = allocate_edge_cpu_bisection(vehicles, rsu_F, tol=1e-3)
 
     decisions: Dict[int, str] = {}
@@ -425,8 +317,6 @@ def algorithm1_resource_allocation_and_choice(vehicles: List[Vehicle], rsu_F: fl
 
         utilities[v.vid] = (u_loc, u_vec)
 
-        # paper’s feasibility check spirit:
-        # if both are awful (infeasible) -> choose none (we map to local to keep simulation moving)
         if u_vec == float("-inf") and u_loc == float("-inf"):
             decisions[v.vid] = "loc"
             continue
@@ -437,11 +327,9 @@ def algorithm1_resource_allocation_and_choice(vehicles: List[Vehicle], rsu_F: fl
         else:
             decisions[v.vid] = "loc"
 
-    # Re-allocate CPU among the actually-offloading vehicles (more realistic and matches Algo2 iterations)
     offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
     final_alloc = allocate_edge_cpu_bisection(offloaders, rsu_F, tol=1e-3)
 
-    # Update U_vec with the final allocation for reporting
     for v in offloaders:
         u_loc, _ = utilities[v.vid]
         utilities[v.vid] = (u_loc, utility_vec(v, final_alloc.get(v.vid, 0.0)))
@@ -449,57 +337,40 @@ def algorithm1_resource_allocation_and_choice(vehicles: List[Vehicle], rsu_F: fl
     return final_alloc, decisions, utilities
 
 
-# ----------------------------
-# Algorithm 2: Distributed MACTER
-# ----------------------------
-
 def distributed_macter(vehicles: List[Vehicle], rsu_F: float, max_iter: int) -> Tuple[Dict[int, float], Dict[int, str], float]:
-    """
-    Distributed MACTER style iterative process.
-    We do best-response updates (practical, converges well).
-    """
-    # Initial: run Algo1 choice once
     alloc, decisions, _ = algorithm1_resource_allocation_and_choice(vehicles, rsu_F)
 
     for _ in range(max_iter):
         prev = decisions.copy()
 
-        # Allocate based on current offload set
         offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
         alloc = allocate_edge_cpu_bisection(offloaders, rsu_F, tol=1e-3)
 
-        # Sequential best response updates (distributed-ish)
         changed = False
         for v in vehicles:
             u_loc = utility_local(v)
-
-            # utility if VEC (if we switch v to vec, re-allocate on that RSU set)
             if decisions[v.vid] == "vec":
                 f_v = alloc.get(v.vid, 0.0)
                 u_vec = utility_vec(v, f_v)
             else:
-                # candidate set = current offloaders + v
-                cand_off = offloaders + [v]
-                cand_alloc = allocate_edge_cpu_bisection(cand_off, rsu_F, tol=1e-3)
-                u_vec = utility_vec(v, cand_alloc.get(v.vid, 0.0))
+                candidate_off = offloaders + [v]
+                candidate_alloc = allocate_edge_cpu_bisection(candidate_off, rsu_F, tol=1e-3)
+                u_vec = utility_vec(v, candidate_alloc.get(v.vid, 0.0))
 
             new_dec = "vec" if (u_vec > u_loc) else "loc"
             if new_dec != decisions[v.vid]:
                 decisions[v.vid] = new_dec
                 changed = True
 
-                # refresh offloaders list for subsequent players (best-response dynamics)
                 offloaders = [vv for vv in vehicles if decisions[vv.vid] == "vec"]
                 alloc = allocate_edge_cpu_bisection(offloaders, rsu_F, tol=1e-3)
 
         if not changed or decisions == prev:
             break
 
-    # Final allocation with final decisions
     offloaders = [v for v in vehicles if decisions[v.vid] == "vec"]
     alloc = allocate_edge_cpu_bisection(offloaders, rsu_F, tol=1e-3)
 
-    # Compute system computation efficiency (paper Eq 17-ish; we use total chosen utility per total energy)
     total_utility = 0.0
     total_energy = 1e-12
 
@@ -519,9 +390,6 @@ def distributed_macter(vehicles: List[Vehicle], rsu_F: float, max_iter: int) -> 
     return alloc, decisions, E
 
 
-# ----------------------------
-# Simulation setup
-# ----------------------------
 
 def make_vehicles(N: int, params: SystemParams, seed: Optional[int] = 7) -> List[Vehicle]:
     if seed is not None:
@@ -557,6 +425,9 @@ def group_by_rsu_extended(vehicles: List[Vehicle], M: int) -> Dict[int, List[Veh
 
     for v in vehicles:
         if can_not_offload_to_this_rsu(v):
+            if v.rsu_id >= v.params.M - 1:
+                groups[v.rsu_id].append(v)
+                continue
             v2 = copy.deepcopy(v)
             v2.rsu_id += 1
             v2.s = v2.rsu_id * v.params.seg_len + 1e-3
@@ -573,42 +444,5 @@ def group_by_rsu_extended(vehicles: List[Vehicle], M: int) -> Dict[int, List[Veh
 def can_not_offload_to_this_rsu(v):
     transmission_time = v.task.alpha_bits / v.rate_bps
     minimum_comp_time = v.task.C_Gcycles / v.params.F_vec_total_GHz
-    result = transmission_time + minimum_comp_time > v.rsu_coverage_time > v.local_time() and v.rsu_coverage_time < v.task.t_max
+    result = transmission_time + minimum_comp_time > v.rsu_coverage_time and v.rsu_coverage_time + v.local_time() < v.task.t_max
     return result
-# ----------------------------
-# Main
-# ----------------------------
-
-if __name__ == "__main__":
-    params = SystemParams()
-    N = 30
-
-    vehicles = make_vehicles(N, params, seed=None)
-    groups = group_by_rsu(vehicles, params.M)
-
-    all_alloc: Dict[int, float] = {}
-    all_dec: Dict[int, str] = {}
-    total_E_parts: List[float] = []
-
-    for rsu_id, vs in groups.items():
-        if not vs:
-            continue
-
-        alloc, dec, E = distributed_macter(vs, rsu_F=params.F_vec_total_GHz, max_iter=params.max_iter_algo2)
-        total_E_parts.append(E)
-
-        all_alloc.update(alloc)
-        all_dec.update(dec)
-
-        print(f"\nRSU {rsu_id}: vehicles={len(vs)} | efficiency={E:.6e}")
-        for v in vs:
-            f = all_alloc.get(v.vid, 0.0)
-            print(
-                f"  v{v.vid:02d} pos={v.s:7.1f}m v={v.v_kmh:5.1f}km/h "
-                f"link={v.link_type:8s} d={v.dist_to_rsu_m:6.1f}m rate={v.rate_bps/1e6:7.1f}Mbps "
-                f"t_ptd={v.practical_tolerable_delay():.3f}s decision={dec[v.vid]:3s} f_vec={f:6.2f}GHz"
-            )
-
-    # crude overall indicator
-    if total_E_parts:
-        print(f"\nOverall mean efficiency across RSUs: {sum(total_E_parts)/len(total_E_parts):.6e}")
