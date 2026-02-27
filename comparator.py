@@ -9,12 +9,13 @@ import statistics
 from typing import Dict, List, Tuple, Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
-from new_money import (
-    SystemParams, Vehicle, Task,
+from macter import (
+    SystemParams, Vehicle,
     utility_local, utility_vec,
     allocate_edge_cpu_bisection,
     distributed_macter,
     make_vehicles, group_by_rsu, group_by_rsu_extended,
+    algorithm1_resource_allocation_and_choice
 )
 
 import matplotlib
@@ -543,11 +544,6 @@ def build_figure(out_path: str, run_seed: int = 0):
 
 
 def _convergence_trace(params: SystemParams, N: int = 25, seed: int = 7, run_seed: int = 0) -> dict:
-    from new_money import (
-        algorithm1_resource_allocation_and_choice,
-        allocate_edge_cpu_bisection,
-    )
-
     vehicles = make_vehicles(N, params, seed=(run_seed + seed) % (2**31))
     groups   = group_by_rsu(vehicles, params.M)
 
@@ -617,7 +613,7 @@ if __name__ == "__main__":
         run_seed = int(env_seed)
         print(f"  (overridden by RUN_SEED env var → {run_seed})")
 
-    out = "macter_vs_random.png"
+    out = "macter_results.png"
     pct_rand, pct_local = build_figure(out, run_seed=run_seed)
     print(f"\n{'='*60}")
     print(f"  MACTER vs Random  : +{pct_rand:.1f}% mean computation efficiency")
